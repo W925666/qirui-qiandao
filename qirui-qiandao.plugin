@@ -1,4 +1,4 @@
-﻿#!name = 奇瑞签到
+#!name = 奇瑞签到
 #!desc = 自动获取本机登录凭据，每天08:00签到；已签到不重复提交，不自动分享文章。
 #!author = W925666
 #!homepage = https://github.com/W925666/qirui-qiandao
