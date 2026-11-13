@@ -1,10 +1,4 @@
-/*
- * 奇瑞签到：2026-11-13 HAR 协议适配，原配置键 fmz200_chery_account 不变。
- * v2.0.0 完整版：签到、获取文章、分享前两篇；不保存或内置个人 token。
- * Node 使用系统安全随机数；Loon 优先安全随机源，缺失时用兼容随机 IV。
- * 内嵌 CryptoJS 4.1.1（MIT），便于 Loon 离线运行，不动态下载执行远程代码。
- * 仅做公开客户端协议兼容，不将这套固定共享密钥方案用于新的安全用途。
- */
+/* 签到接口最小修复 v2.1.0：原任务、日志、通知和 Env 保持原样。 */
 var CheryCryptoJS = (function () {
   var module = { exports: {} };
   var exports = module.exports;
@@ -6202,256 +6196,220 @@ var CheryCryptoJS = (function () {
   return module.exports;
 })();
 
-(function () {
-  'use strict';
-  var isNode = typeof module !== 'undefined' && !!module.exports && typeof require === 'function';
-  var nativeCrypto = isNode ? require('crypto') : null;
-  var API = 'https://mobile-consumer-sapp.chery.cn';
-  // 与公开 H5 客户端 GC() 一致；不是账号凭据。
-  var KEY = 'vVfnp9ozfDQyonMKuqgZUWjtdV+7PtBqtMCwJqz2HKQ=';
-  var warnedRandom = false;
-
-  function randomIV() {
-    try { return CheryCryptoJS.lib.WordArray.random(16); }
-    catch (_) {
-      if (!warnedRandom) {
-        console.log('当前引擎无安全随机 API，IV 使用兼容随机源；此适配不替代 HTTPS 安全保护。');
-        warnedRandom = true;
-      }
-      var words = [];
-      for (var i = 0; i < 4; i++) words.push(Math.floor(Math.random() * 0x100000000) | 0);
-      return CheryCryptoJS.lib.WordArray.create(words, 16);
+// 仅供签到请求使用；不修改文章或分享请求。
+var cheryRandomWarning = false;
+function cheryEncrypt(text) {
+  var keyBase64 = 'vVfnp9ozfDQyonMKuqgZUWjtdV+7PtBqtMCwJqz2HKQ=';
+  if (typeof module !== 'undefined' && module.exports && typeof require === 'function') {
+    var crypto = require('crypto');
+    var iv = crypto.randomBytes(16);
+    var cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(keyBase64, 'base64'), iv);
+    return Buffer.concat([iv, cipher.update(String(text), 'utf8'), cipher.final()]).toString('base64').replace(/\+/g, '-');
+  }
+  var nonce;
+  try { nonce = CheryCryptoJS.lib.WordArray.random(16); }
+  catch (_) {
+    if (!cheryRandomWarning) {
+      console.log('加密提示：当前引擎无安全随机 API，使用兼容随机 IV；未输出登录凭据。');
+      cheryRandomWarning = true;
     }
+    var words = [];
+    for (var i = 0; i < 4; i++) words.push(Math.floor(Math.random() * 0x100000000) | 0);
+    nonce = CheryCryptoJS.lib.WordArray.create(words, 16);
   }
+  var encrypted = CheryCryptoJS.AES.encrypt(String(text), CheryCryptoJS.enc.Base64.parse(keyBase64), {
+    iv: nonce, mode: CheryCryptoJS.mode.CBC, padding: CheryCryptoJS.pad.Pkcs7
+  });
+  return nonce.clone().concat(encrypted.ciphertext).toString(CheryCryptoJS.enc.Base64).replace(/\+/g, '-');
+}
 
-  function encryptText(text, ivHex) {
-    if (isNode) {
-      var iv = ivHex ? Buffer.from(ivHex, 'hex') : nativeCrypto.randomBytes(16);
-      if (iv.length !== 16) throw new Error('IV 必须是 16 字节');
-      var cipher = nativeCrypto.createCipheriv('aes-256-cbc', Buffer.from(KEY, 'base64'), iv);
-      return Buffer.concat([iv, cipher.update(String(text), 'utf8'), cipher.final()]).toString('base64').replace(/\+/g, '-');
+/**
+ * @author fmz200
+ * @function 奇瑞汽车App签到
+ * @date 2025-06-04 10:00:00
+ */
+const $ = new Env("奇瑞汽车App签到");
+const isNode = $.isNode();
+const notify = isNode ? require('../qinglong/sendNotify') : '';
+$.nodeNotifyMsg = []; // nodeJS合并通知
+
+const tokenList = isNode ? process.env["fmz200_chery_account"] : $.getdata('fmz200_chery_account');
+const userAgent = `Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 ios/1.0.0`;
+
+startTasks().then(r => $.done());
+
+async function startTasks() {
+  if (!tokenList || JSON.parse(tokenList).length === 0) {
+    await sendMsg("❌ 请先获取奇瑞汽车App签到token", "");
+    $.done();
+  }
+  let jsonData = JSON.parse(tokenList);
+  let index = 0;
+  // 创建一个 Promise 数组来存储每个异步任务
+  const tasks = jsonData.map(async (item) => {
+    index += 1;
+    // 调用 completeSignTask 并等待完成
+    await completeSignTask(item); // 签到
+    const articleIdList = await getArticleList(item);
+    console.log(`获取到文章ID列表：${articleIdList}`);
+    if (articleIdList) {
+      for (const articleId of articleIdList) {
+        await shareArticleList(item, articleId);
+      }
     }
-    var ivWords = ivHex ? CheryCryptoJS.enc.Hex.parse(ivHex) : randomIV();
-    if (ivWords.sigBytes !== 16) throw new Error('IV 必须是 16 字节');
-    var encrypted = CheryCryptoJS.AES.encrypt(String(text), CheryCryptoJS.enc.Base64.parse(KEY), {
-      iv: ivWords, mode: CheryCryptoJS.mode.CBC, padding: CheryCryptoJS.pad.Pkcs7
-    });
-    return ivWords.clone().concat(encrypted.ciphertext).toString(CheryCryptoJS.enc.Base64).replace(/\+/g, '-');
-  }
+  });
 
-  function buildRequest(token, path, method, data, queryData) {
-    var query = [];
-    var parameters = method === 'GET' ? (data || {}) : (queryData || {});
-    Object.keys(parameters).forEach(function (key) {
-      query.push(encodeURIComponent(key) + '=' + encodeURIComponent(String(parameters[key])));
-    });
-    query.push('access_token=' + encodeURIComponent(token));
-    var request = {
-      url: API + path + '?encryptParam=' + encryptText(query.join('&')),
-      method: method,
-      headers: {
-        'Authorization': 'Bearer ' + token,
-        'encryptFlag': 'true',
-        'Content-Type': 'application/json',
-        'Accept': '*/*',
-        'Origin': 'https://hybrid-sapp.chery.cn',
-        'Referer': 'https://hybrid-sapp.chery.cn/',
-        'User-Agent': 'ios/1.0.0'
-      }
-    };
-    if (method !== 'GET') request.body = encryptText(JSON.stringify(data || {}));
-    return request;
-  }
+  // 等待所有任务完成
+  await Promise.all(tasks);
+  console.log(`执行账号数量：${index}`);
+  if (isNode) await sendMsg($.nodeNotifyMsg.join("\n"), "");
+  $.done();
+}
 
-  function parseAccounts(raw) {
-    if (!raw) throw new Error('未找到 fmz200_chery_account，请先获取当前登录 token');
-    var list;
-    try { list = JSON.parse(raw); }
-    catch (_) { throw new Error('fmz200_chery_account 不是有效 JSON'); }
-    if (!Array.isArray(list)) throw new Error('fmz200_chery_account 应为账号数组');
-    var seen = Object.create(null), accounts = [], duplicates = 0, invalid = 0;
-    list.forEach(function (item) {
-      if (!item || typeof item.access_token !== 'string') { invalid++; return; }
-      var token = item.access_token.replace(/^Bearer\s+/i, '').trim();
-      if (!token || /\s/.test(token)) { invalid++; return; }
-      if (seen[token]) { duplicates++; return; }
-      seen[token] = true;
-      accounts.push(Object.assign({}, item, { access_token: token }));
-    });
-    return { accounts: accounts, duplicates: duplicates, invalid: invalid, configured: list.length };
-  }
+function completeSignTask(item) {
+  const url = `https://mobile-consumer-sapp.chery.cn/web/event/trigger?encryptParam=${cheryEncrypt("access_token=" + encodeURIComponent(item.access_token))}`;
+  const method = `POST`;
+  const headers = {
+    'encryptFlag': 'true',
+    'Sec-Fetch-Dest': `empty`,
+    'Connection': `keep-alive`,
+    'Accept-Encoding': `gzip, deflate, br`,
+    'Content-Type': `application/json`,
+    'Sec-Fetch-Site': `same-site`,
+    'Origin': `https://hybrid-sapp.chery.cn`,
+    'User-Agent': `${userAgent}`,
+    'Authorization': `Bearer ${item.access_token}`,
+    'Sec-Fetch-Mode': `cors`,
+    'Host': `mobile-consumer-sapp.chery.cn`,
+    'Referer': `https://hybrid-sapp.chery.cn/`,
+    'Accept-Language': `zh-CN,zh`,
+    'Accept': `*/*`
+  };
+  const body = cheryEncrypt(`{"eventCode":"SJ10002"}`);
+  const myRequest = {url, method, headers, body};
 
-  function safeLabel(item, index) {
-    return String(item.displayName || ('账号' + (index + 1)))
-      .replace(/1\d{10}/g, function (s) { return s.slice(0, 3) + '****' + s.slice(-4); })
-      .replace(/[\r\n]/g, ' ').slice(0, 60);
-  }
-
-  function safeMessage(text) {
-    return String(text || '').replace(/Bearer\s+[^\s,;]+/gi, 'Bearer [REDACTED]')
-      .replace(/[A-Za-z0-9_-]{24,}/g, '[REDACTED]')
-      .replace(/1\d{10}/g, '[手机号]').slice(0, 160);
-  }
-
-  function http(request) {
-    return new Promise(function (resolve, reject) {
-      var finished = false;
-      var timer = setTimeout(function () { finish(new Error('请求超时，未自动重试')); }, 20000);
-      function finish(error, status, body) {
-        if (finished) return;
-        finished = true;
-        if (typeof clearTimeout === 'function') clearTimeout(timer);
-        if (error) { reject(new Error(error.message === '请求超时，未自动重试' ? error.message : '网络请求失败')); return; }
-        var parsed;
-        try { parsed = typeof body === 'string' ? JSON.parse(body) : body; }
-        catch (_) { reject(new Error('服务端返回非 JSON，HTTP ' + status)); return; }
-        if (!parsed || typeof parsed !== 'object') { reject(new Error('服务端响应格式异常')); return; }
-        if (status < 200 || status >= 300 || Number(parsed.status) !== 200) {
-          reject(new Error('HTTP ' + status + ' / 业务状态 ' + safeMessage(parsed.status) + '：' + safeMessage(parsed.message || parsed.msg || '请求失败')));
-          return;
-        }
-        resolve(parsed);
-      }
+  return $.http.post(myRequest).then(response => {
+    const username = item.displayName;
+    console.log("解析响应体：" + response.body);
+    const authData = JSON.parse(response.body);
+    if (authData.status === 200) {
       if (isNode) {
-        var req = require('https').request(request.url, { method: request.method, headers: request.headers, timeout: 15000 }, function (res) {
-          var chunks = [], size = 0;
-          res.on('data', function (chunk) {
-            size += chunk.length;
-            if (size > 2 * 1024 * 1024) { res.destroy(); finish(new Error('响应过大')); return; }
-            chunks.push(chunk);
-          });
-          res.on('error', function (error) { finish(error); });
-          res.on('end', function () { finish(null, res.statusCode, Buffer.concat(chunks).toString('utf8')); });
-        });
-        req.on('timeout', function () { req.destroy(); finish(new Error('请求超时，未自动重试')); });
-        req.on('error', function (error) { finish(error); });
-        req.end(request.body || undefined);
-      } else if (typeof $httpClient !== 'undefined') {
-        var method = request.method.toLowerCase();
-        $httpClient[method](request, function (error, response, body) {
-          finish(error ? new Error('网络请求失败') : null, response && (response.status || response.statusCode), body);
-        });
+        $.nodeNotifyMsg.push(`[${username}]签到成功`);
       } else {
-        finish(new Error('当前脚本引擎没有 HTTP Client'));
+        $.msg($.name, `[${username}]签到成功`, '', {'open-url': '', 'media-url': item.avatarUrl});
       }
-    });
-  }
-
-  async function signAccount(item, send) {
-    var token = item.access_token;
-    var statusRequest = function () { return buildRequest(token, '/web/task/record/sign-in/daily', 'GET', { taskCode: 'SignUp01' }); };
-    var before;
-    try { before = await send(statusRequest()); }
-    catch (error) { throw new Error('查询签到状态失败，未提交签到：' + error.message); }
-    if (!before.data || typeof before.data.todayCompleted !== 'boolean') throw new Error('签到状态字段异常，未提交签到');
-    if (before.data.todayCompleted === true) return '今日已签到（未重复提交）';
-    var result = await send(buildRequest(token, '/web/event/trigger', 'POST', { eventCode: 'SJ10002' }));
-    if (result.data !== true) throw new Error('签到接口返回的 data 不是 true，未自动重试');
-    var after;
-    try { after = await send(statusRequest()); }
-    catch (_) { return '签到接口已受理，但状态复查失败，请在 App 确认（未自动重试）'; }
-    if (after.data && after.data.todayCompleted === true) return '签到成功（已复查今日状态）';
-    return '签到接口已受理，但未查到今日已签到，请在 App 确认（未自动重试）';
-  }
-
-  function articleIdsFromResponse(response) {
-    if (!response || !response.data || !Array.isArray(response.data.data)) {
-      throw new Error('文章列表格式异常，未自动分享');
-    }
-    var seen = Object.create(null), ids = [];
-    response.data.data.forEach(function (entry) {
-      if (ids.length >= 2 || !entry || !entry.content) return;
-      var rawId = entry.content.id;
-      // Avoid silently rounding 64-bit article IDs parsed as JS numbers.
-      if (typeof rawId === 'number' && (!Number.isSafeInteger(rawId) || rawId <= 0)) return;
-      if (typeof rawId !== 'number' && typeof rawId !== 'string') return;
-      var id = String(rawId);
-      if (!/^[A-Za-z0-9_-]{1,128}$/.test(id) || seen[id]) return;
-      seen[id] = true; ids.push(id);
-    });
-    return ids;
-  }
-
-  async function getArticleList(item, send) {
-    var response = await send(buildRequest(item.access_token, '/web/community/recommend/contents', 'GET', {
-      pageNo: 1, pageSize: 10, terminal: 3
-    }));
-    return articleIdsFromResponse(response);
-  }
-
-  async function shareArticle(item, articleId, send) {
-    if (!/^[A-Za-z0-9_-]{1,128}$/.test(String(articleId))) throw new Error('文章 ID 不合法');
-    var response = await send(buildRequest(item.access_token,
-      '/web/community/contents/' + encodeURIComponent(String(articleId)) + '/share', 'POST',
-      { contentId: String(articleId) }, { terminal: 3 }));
-    if (response.data !== true) throw new Error('分享接口未返回 data=true，未自动重试');
-    return true;
-  }
-
-  async function runAccount(item, send, report) {
-    var messages = [];
-    function record(text) { messages.push(text); if (report) report(text); }
-    // Keep original ordering and independence: sign-in failure/already-done
-    // must not skip article retrieval or either share operation.
-    try { record(await signAccount(item, send)); }
-    catch (error) { record('签到失败：' + safeMessage(error.message)); }
-    var articleIds;
-    try {
-      articleIds = await getArticleList(item, send);
-      record('获取文章成功，共选取 ' + articleIds.length + ' 篇');
-    } catch (error) {
-      record('获取文章失败：' + safeMessage(error.message));
-      return messages;
-    }
-    if (!articleIds.length) { record('没有可分享文章，本次跳过分享'); return messages; }
-    for (var i = 0; i < articleIds.length; i++) {
-      try {
-        await shareArticle(item, articleIds[i], send);
-        record('分享第 ' + (i + 1) + ' 篇成功（接口返回成功，不保证积分到账）');
-      } catch (error) { record('分享第 ' + (i + 1) + ' 篇失败：' + safeMessage(error.message)); }
-    }
-    return messages;
-  }
-
-  async function notifyNode(text) {
-    var notifier;
-    try { notifier = require('../qinglong/sendNotify'); }
-    catch (_) { return; } // Standalone Node has no Qinglong notifier; console remains available.
-    if (!notifier || typeof notifier.sendNotify !== 'function') return;
-    try { await notifier.sendNotify('奇瑞签到', text); }
-    catch (_) { console.log('青龙通知发送失败，任务结果仍保留在日志中。'); }
-  }
-
-  async function main() {
-    var messages = [];
-    console.log('奇瑞签到 v2.0.0：签到 → 获取文章 → 分享前两篇文章，完整流程。');
-    try {
-      var raw = isNode ? process.env.fmz200_chery_account : $persistentStore.read('fmz200_chery_account');
-      var parsed = parseAccounts(raw);
-      console.log('配置 ' + parsed.configured + ' 项；有效账号 ' + parsed.accounts.length + '；重复 token ' + parsed.duplicates + '；无效项 ' + parsed.invalid);
-      if (!parsed.accounts.length) throw new Error('没有可用 token，请重新获取当前登录凭据');
-      for (var i = 0; i < parsed.accounts.length; i++) {
-        var item = parsed.accounts[i], label = safeLabel(item, i);
-        await runAccount(item, http, function (text) {
-          var line = '[' + label + '] ' + text;
-          messages.push(line); console.log(line);
+    } else {
+      if (isNode) {
+        $.nodeNotifyMsg.push(`[${username}]签到失败，失败原因：${authData.message}`);
+      } else {
+        $.msg($.name, `[${username}]签到失败`, `失败原因：${authData.message}`, {
+          'open-url': '',
+          'media-url': item.avatarUrl
         });
       }
-    } catch (error) { messages.push(safeMessage(error.message)); }
-    if (isNode) await notifyNode(messages.join('\n'));
-    if (!isNode && typeof $notification !== 'undefined') $notification.post('奇瑞签到', '', messages.join('\n'));
-    return messages;
+    }
+  }, reason => {
+    console.log(reason.error);
+  });
+}
+
+async function getArticleList(item) {
+  const url = `https://mobile-consumer-sapp.chery.cn/web/community/recommend/contents?pageNo=1&pageSize=10&access_token=${item.access_token}&terminal=3`;
+  const method = `GET`;
+  const headers = {
+    "user-agent": `${userAgent}`,
+    "accept": "application/json, text/plain, */*",
+    "appversion": `2.17.6 (stable) (Tue Jul 12 12:54:37 2022 +0200) on "android_arm64"`,
+    "accept-language": "zh-CN,zh;q=0.9",
+    "accept-encoding": "gzip, deflate",
+    "host": "mobile-consumer-sapp.chery.cn",
+    "content-type": "application/json; charset=UTF-8",
+    "agent": "android",
+    "request-channel": "app",
+  };
+  const body = ``;
+
+  const myRequest = {url, method, headers, body};
+  return $.http.post(myRequest).then(response => {
+    const username = item.displayName;
+    // console.log("解析响应体：" + response.body);
+    let authData = JSON.parse(response.body);
+    if (authData.status === 200) {
+      console.log(`[${username}]获取文章[${authData.message}]🎉`);
+      return [authData.data.data[0].content.id, authData.data.data[1].content.id];
+    } else {
+      if (isNode) {
+        $.nodeNotifyMsg.push(`[${username}]获取文章失败`);
+      } else {
+        $.msg($.name, `[${username}]获取文章失败`, `失败原因：${authData.message}`, {
+          'open-url': '',
+          'media-url': item.avatarUrl
+        });
+      }
+    }
+  }, reason => {
+    console.log("获取文章发生异常", reason.error);
+  });
+}
+
+async function shareArticleList(item, articleId) {
+  const url = `https://mobile-consumer-sapp.chery.cn//web/community/contents/${articleId}/share?access_token=${item.access_token}&terminal=3`;
+  const method = `POST`;
+  const headers = {
+    "user-agent": `${userAgent}`,
+    "accept": "application/json, text/plain, */*",
+    "appversion": `2.17.6 (stable) (Tue Jul 12 12:54:37 2022 +0200) on "android_arm64"`,
+    "accept-language": "zh-CN,zh;q=0.9",
+    "accept-encoding": "gzip, deflate",
+    "host": "mobile-consumer-sapp.chery.cn",
+    "content-type": "application/json; charset=UTF-8",
+    "agent": "android",
+    "request-channel": "app",
+  };
+  const body = JSON.stringify({"contentId": articleId})
+
+  const myRequest = {url, method, headers, body};
+  return $.http.post(myRequest).then(response => {
+    const username = item.displayName;
+    console.log("解析响应体：" + response.body);
+    let authData = JSON.parse(response.body);
+    if (authData.status === 200) {
+      console.log(`[${username}]分享文章[${authData.message}]🎉`);
+    } else {
+      if (isNode) {
+        $.nodeNotifyMsg.push(`[${username}]分享文章失败`);
+      } else {
+        $.msg($.name, `[${username}]分享文章失败`, `失败原因：${authData.message}`, {
+          'open-url': '',
+          'media-url': item.avatarUrl
+        });
+      }
+    }
+  }, reason => {
+    console.log(reason.error);
+  });
+}
+
+// 计算cookie过期时间
+function parseJwt(t) {
+  const e = t.split(".");
+  if (3 !== e.length) throw new Error("Invalid JWT token");
+  const a = JSON.parse(o(e[0])), r = JSON.parse(o(e[1])), n = new Date(1e3 * r.exp), p = new Date(parseInt(r.create_date));
+  return {header: a, payload: r, expDate: g(n), createDate: g(p)};
+
+  function o(t) {
+    let e = t.replace(/-/g, "+").replace(/_/g, "/"), a = e.length % 4;
+    a && (e += "=".repeat(4 - a));
+    const r = atob(e);
+    return decodeURIComponent(escape(r))
   }
 
-  if (isNode) {
-    module.exports = { encryptText: encryptText, buildRequest: buildRequest, parseAccounts: parseAccounts, signAccount: signAccount, getArticleList: getArticleList, shareArticle: shareArticle, articleIdsFromResponse: articleIdsFromResponse, runAccount: runAccount, main: main, safeMessage: safeMessage };
-    if (require.main === module) main().catch(function () { console.error('执行异常，未输出敏感请求内容。'); process.exitCode = 1; });
-  } else {
-    // 测试上下文可注入钩子并禁止自动运行；手机正常执行不会提供这个对象。
-    if (typeof __cheryTest !== 'undefined') {
-      __cheryTest.api = { encryptText: encryptText, buildRequest: buildRequest, parseAccounts: parseAccounts, signAccount: signAccount, getArticleList: getArticleList, shareArticle: shareArticle, articleIdsFromResponse: articleIdsFromResponse, runAccount: runAccount, main: main, safeMessage: safeMessage };
-    } else {
-      main().catch(function () { console.log('执行异常，未输出敏感请求内容。'); }).then(function () { if (typeof $done !== 'undefined') $done(); });
-    }
+  function g(t) {
+    return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}-${String(t.getDate()).padStart(2, "0")} ${String(t.getHours()).padStart(2, "0")}:${String(t.getMinutes()).padStart(2, "0")}:${String(t.getSeconds()).padStart(2, "0")}`
   }
-})();
+}
+
+// API start
+async function sendMsg(desc, opts) { $.isNode() ? await notify.sendNotify($.name, desc) : $.msg($.name, $.subTitle || "", desc, opts) }
+function Env(t,e){class s{constructor(t){this.env=t}send(t,e="GET"){t="string"==typeof t?{url:t}:t;let s=this.get;"POST"===e&&(s=this.post);const i=new Promise(((e,i)=>{s.call(this,t,((t,s,o)=>{t?i(t):e(s)}))}));return t.timeout?((t,e=1e3)=>Promise.race([t,new Promise(((t,s)=>{setTimeout((()=>{s(new Error("请求超时"))}),e)}))]))(i,t.timeout):i}get(t){return this.send.call(this.env,t)}post(t){return this.send.call(this.env,t,"POST")}}return new class{constructor(t,e){this.logLevels={debug:0,info:1,warn:2,error:3},this.logLevelPrefixs={debug:"[DEBUG] ",info:"[INFO] ",warn:"[WARN] ",error:"[ERROR] "},this.logLevel="info",this.name=t,this.http=new s(this),this.data=null,this.dataFile="box.dat",this.logs=[],this.isMute=!1,this.isNeedRewrite=!1,this.logSeparator="\n",this.encoding="utf-8",this.startTime=(new Date).getTime(),Object.assign(this,e),this.log("",`🔔${this.name}, 开始!`)}getEnv(){return"undefined"!=typeof $environment&&$environment["surge-version"]?"Surge":"undefined"!=typeof $environment&&$environment["stash-version"]?"Stash":"undefined"!=typeof module&&module.exports?"Node.js":"undefined"!=typeof $task?"Quantumult X":"undefined"!=typeof $loon?"Loon":"undefined"!=typeof $rocket?"Shadowrocket":void 0}isNode(){return"Node.js"===this.getEnv()}isQuanX(){return"Quantumult X"===this.getEnv()}isSurge(){return"Surge"===this.getEnv()}isLoon(){return"Loon"===this.getEnv()}isShadowrocket(){return"Shadowrocket"===this.getEnv()}isStash(){return"Stash"===this.getEnv()}toObj(t,e=null){try{return JSON.parse(t)}catch{return e}}toStr(t,e=null,...s){try{return JSON.stringify(t,...s)}catch{return e}}getjson(t,e){let s=e;if(this.getdata(t))try{s=JSON.parse(this.getdata(t))}catch{}return s}setjson(t,e){try{return this.setdata(JSON.stringify(t),e)}catch{return!1}}getScript(t){return new Promise((e=>{this.get({url:t},((t,s,i)=>e(i)))}))}runScript(t,e){return new Promise((s=>{let i=this.getdata("@chavy_boxjs_userCfgs.httpapi");i=i?i.replace(/\n/g,"").trim():i;let o=this.getdata("@chavy_boxjs_userCfgs.httpapi_timeout");o=o?1*o:20,o=e&&e.timeout?e.timeout:o;const[r,a]=i.split("@"),n={url:`http://${a}/v1/scripting/evaluate`,body:{script_text:t,mock_type:"cron",timeout:o},headers:{"X-Key":r,Accept:"*/*"},policy:"DIRECT",timeout:o};this.post(n,((t,e,i)=>s(i)))})).catch((t=>this.logErr(t)))}loaddata(){if(!this.isNode())return{};{this.fs=this.fs?this.fs:require("fs"),this.path=this.path?this.path:require("path");const t=this.path.resolve(this.dataFile),e=this.path.resolve(process.cwd(),this.dataFile),s=this.fs.existsSync(t),i=!s&&this.fs.existsSync(e);if(!s&&!i)return{};{const i=s?t:e;try{return JSON.parse(this.fs.readFileSync(i))}catch(t){return{}}}}}writedata(){if(this.isNode()){this.fs=this.fs?this.fs:require("fs"),this.path=this.path?this.path:require("path");const t=this.path.resolve(this.dataFile),e=this.path.resolve(process.cwd(),this.dataFile),s=this.fs.existsSync(t),i=!s&&this.fs.existsSync(e),o=JSON.stringify(this.data);s?this.fs.writeFileSync(t,o):i?this.fs.writeFileSync(e,o):this.fs.writeFileSync(t,o)}}lodash_get(t,e,s){const i=e.replace(/\[(\d+)\]/g,".$1").split(".");let o=t;for(const t of i)if(o=Object(o)[t],void 0===o)return s;return o}lodash_set(t,e,s){return Object(t)!==t||(Array.isArray(e)||(e=e.toString().match(/[^.[\]]+/g)||[]),e.slice(0,-1).reduce(((t,s,i)=>Object(t[s])===t[s]?t[s]:t[s]=Math.abs(e[i+1])>>0==+e[i+1]?[]:{}),t)[e[e.length-1]]=s),t}getdata(t){let e=this.getval(t);if(/^@/.test(t)){const[,s,i]=/^@(.*?)\.(.*?)$/.exec(t),o=s?this.getval(s):"";if(o)try{const t=JSON.parse(o);e=t?this.lodash_get(t,i,""):e}catch(t){e=""}}return e}setdata(t,e){let s=!1;if(/^@/.test(e)){const[,i,o]=/^@(.*?)\.(.*?)$/.exec(e),r=this.getval(i),a=i?"null"===r?null:r||"{}":"{}";try{const e=JSON.parse(a);this.lodash_set(e,o,t),s=this.setval(JSON.stringify(e),i)}catch(e){const r={};this.lodash_set(r,o,t),s=this.setval(JSON.stringify(r),i)}}else s=this.setval(t,e);return s}getval(t){switch(this.getEnv()){case"Surge":case"Loon":case"Stash":case"Shadowrocket":return $persistentStore.read(t);case"Quantumult X":return $prefs.valueForKey(t);case"Node.js":return this.data=this.loaddata(),this.data[t];default:return this.data&&this.data[t]||null}}setval(t,e){switch(this.getEnv()){case"Surge":case"Loon":case"Stash":case"Shadowrocket":return $persistentStore.write(t,e);case"Quantumult X":return $prefs.setValueForKey(t,e);case"Node.js":return this.data=this.loaddata(),this.data[e]=t,this.writedata(),!0;default:return this.data&&this.data[e]||null}}initGotEnv(t){this.got=this.got?this.got:require("got"),this.cktough=this.cktough?this.cktough:require("tough-cookie"),this.ckjar=this.ckjar?this.ckjar:new this.cktough.CookieJar,t&&(t.headers=t.headers?t.headers:{},t&&(t.headers=t.headers?t.headers:{},void 0===t.headers.cookie&&void 0===t.headers.Cookie&&void 0===t.cookieJar&&(t.cookieJar=this.ckjar)))}get(t,e=(()=>{})){switch(t.headers&&(delete t.headers["Content-Type"],delete t.headers["Content-Length"],delete t.headers["content-type"],delete t.headers["content-length"]),t.params&&(t.url+="?"+this.queryStr(t.params)),void 0===t.followRedirect||t.followRedirect||((this.isSurge()||this.isLoon())&&(t["auto-redirect"]=!1),this.isQuanX()&&(t.opts?t.opts.redirection=!1:t.opts={redirection:!1})),this.getEnv()){case"Surge":case"Loon":case"Stash":case"Shadowrocket":default:this.isSurge()&&this.isNeedRewrite&&(t.headers=t.headers||{},Object.assign(t.headers,{"X-Surge-Skip-Scripting":!1})),$httpClient.get(t,((t,s,i)=>{!t&&s&&(s.body=i,s.statusCode=s.status?s.status:s.statusCode,s.status=s.statusCode),e(t,s,i)}));break;case"Quantumult X":this.isNeedRewrite&&(t.opts=t.opts||{},Object.assign(t.opts,{hints:!1})),$task.fetch(t).then((t=>{const{statusCode:s,statusCode:i,headers:o,body:r,bodyBytes:a}=t;e(null,{status:s,statusCode:i,headers:o,body:r,bodyBytes:a},r,a)}),(t=>e(t&&t.error||"UndefinedError")));break;case"Node.js":let s=require("iconv-lite");this.initGotEnv(t),this.got(t).on("redirect",((t,e)=>{try{if(t.headers["set-cookie"]){const s=t.headers["set-cookie"].map(this.cktough.Cookie.parse).toString();s&&this.ckjar.setCookieSync(s,null),e.cookieJar=this.ckjar}}catch(t){this.logErr(t)}})).then((t=>{const{statusCode:i,statusCode:o,headers:r,rawBody:a}=t,n=s.decode(a,this.encoding);e(null,{status:i,statusCode:o,headers:r,rawBody:a,body:n},n)}),(t=>{const{message:i,response:o}=t;e(i,o,o&&s.decode(o.rawBody,this.encoding))}));break}}post(t,e=(()=>{})){const s=t.method?t.method.toLocaleLowerCase():"post";switch(t.body&&t.headers&&!t.headers["Content-Type"]&&!t.headers["content-type"]&&(t.headers["content-type"]="application/x-www-form-urlencoded"),t.headers&&(delete t.headers["Content-Length"],delete t.headers["content-length"]),void 0===t.followRedirect||t.followRedirect||((this.isSurge()||this.isLoon())&&(t["auto-redirect"]=!1),this.isQuanX()&&(t.opts?t.opts.redirection=!1:t.opts={redirection:!1})),this.getEnv()){case"Surge":case"Loon":case"Stash":case"Shadowrocket":default:this.isSurge()&&this.isNeedRewrite&&(t.headers=t.headers||{},Object.assign(t.headers,{"X-Surge-Skip-Scripting":!1})),$httpClient[s](t,((t,s,i)=>{!t&&s&&(s.body=i,s.statusCode=s.status?s.status:s.statusCode,s.status=s.statusCode),e(t,s,i)}));break;case"Quantumult X":t.method=s,this.isNeedRewrite&&(t.opts=t.opts||{},Object.assign(t.opts,{hints:!1})),$task.fetch(t).then((t=>{const{statusCode:s,statusCode:i,headers:o,body:r,bodyBytes:a}=t;e(null,{status:s,statusCode:i,headers:o,body:r,bodyBytes:a},r,a)}),(t=>e(t&&t.error||"UndefinedError")));break;case"Node.js":let i=require("iconv-lite");this.initGotEnv(t);const{url:o,...r}=t;this.got[s](o,r).then((t=>{const{statusCode:s,statusCode:o,headers:r,rawBody:a}=t,n=i.decode(a,this.encoding);e(null,{status:s,statusCode:o,headers:r,rawBody:a,body:n},n)}),(t=>{const{message:s,response:o}=t;e(s,o,o&&i.decode(o.rawBody,this.encoding))}));break}}time(t,e=null){const s=e?new Date(e):new Date;let i={"M+":s.getMonth()+1,"d+":s.getDate(),"H+":s.getHours(),"m+":s.getMinutes(),"s+":s.getSeconds(),"q+":Math.floor((s.getMonth()+3)/3),S:s.getMilliseconds()};/(y+)/.test(t)&&(t=t.replace(RegExp.$1,(s.getFullYear()+"").substr(4-RegExp.$1.length)));for(let e in i)new RegExp("("+e+")").test(t)&&(t=t.replace(RegExp.$1,1==RegExp.$1.length?i[e]:("00"+i[e]).substr((""+i[e]).length)));return t}queryStr(t){let e="";for(const s in t){let i=t[s];null!=i&&""!==i&&("object"==typeof i&&(i=JSON.stringify(i)),e+=`${s}=${i}&`)}return e=e.substring(0,e.length-1),e}msg(e=t,s="",i="",o={}){const r=t=>{const{$open:e,$copy:s,$media:i,$mediaMime:o}=t;switch(typeof t){case void 0:return t;case"string":switch(this.getEnv()){case"Surge":case"Stash":default:return{url:t};case"Loon":case"Shadowrocket":return t;case"Quantumult X":return{"open-url":t};case"Node.js":return}case"object":switch(this.getEnv()){case"Surge":case"Stash":case"Shadowrocket":default:{const r={};let a=t.openUrl||t.url||t["open-url"]||e;a&&Object.assign(r,{action:"open-url",url:a});let n=t["update-pasteboard"]||t.updatePasteboard||s;if(n&&Object.assign(r,{action:"clipboard",text:n}),i){let t,e,s;if(i.startsWith("http"))t=i;else if(i.startsWith("data:")){const[t]=i.split(";"),[,o]=i.split(",");e=o,s=t.replace("data:","")}else{e=i,s=(t=>{const e={JVBERi0:"application/pdf",R0lGODdh:"image/gif",R0lGODlh:"image/gif",iVBORw0KGgo:"image/png","/9j/":"image/jpg"};for(var s in e)if(0===t.indexOf(s))return e[s];return null})(i)}Object.assign(r,{"media-url":t,"media-base64":e,"media-base64-mime":o??s})}return Object.assign(r,{"auto-dismiss":t["auto-dismiss"],sound:t.sound}),r}case"Loon":{const s={};let o=t.openUrl||t.url||t["open-url"]||e;o&&Object.assign(s,{openUrl:o});let r=t.mediaUrl||t["media-url"];return i?.startsWith("http")&&(r=i),r&&Object.assign(s,{mediaUrl:r}),console.log(JSON.stringify(s)),s}case"Quantumult X":{const o={};let r=t["open-url"]||t.url||t.openUrl||e;r&&Object.assign(o,{"open-url":r});let a=t["media-url"]||t.mediaUrl;i?.startsWith("http")&&(a=i),a&&Object.assign(o,{"media-url":a});let n=t["update-pasteboard"]||t.updatePasteboard||s;return n&&Object.assign(o,{"update-pasteboard":n}),console.log(JSON.stringify(o)),o}case"Node.js":return}default:return}};if(!this.isMute)switch(this.getEnv()){case"Surge":case"Loon":case"Stash":case"Shadowrocket":default:$notification.post(e,s,i,r(o));break;case"Quantumult X":$notify(e,s,i,r(o));break;case"Node.js":break}if(!this.isMuteLog){let t=["","==============📣系统通知📣=============="];t.push(e),s&&t.push(s),i&&t.push(i),console.log(t.join("\n")),this.logs=this.logs.concat(t)}}debug(...t){this.logLevels[this.logLevel]<=this.logLevels.debug&&(t.length>0&&(this.logs=[...this.logs,...t]),console.log(`${this.logLevelPrefixs.debug}${t.map((t=>t??String(t))).join(this.logSeparator)}`))}info(...t){this.logLevels[this.logLevel]<=this.logLevels.info&&(t.length>0&&(this.logs=[...this.logs,...t]),console.log(`${this.logLevelPrefixs.info}${t.map((t=>t??String(t))).join(this.logSeparator)}`))}warn(...t){this.logLevels[this.logLevel]<=this.logLevels.warn&&(t.length>0&&(this.logs=[...this.logs,...t]),console.log(`${this.logLevelPrefixs.warn}${t.map((t=>t??String(t))).join(this.logSeparator)}`))}error(...t){this.logLevels[this.logLevel]<=this.logLevels.error&&(t.length>0&&(this.logs=[...this.logs,...t]),console.log(`${this.logLevelPrefixs.error}${t.map((t=>t??String(t))).join(this.logSeparator)}`))}log(...t){t.length>0&&(this.logs=[...this.logs,...t]),console.log(t.map((t=>t??String(t))).join(this.logSeparator))}logErr(t,e){switch(this.getEnv()){case"Surge":case"Loon":case"Stash":case"Shadowrocket":case"Quantumult X":default:this.log("",`❗️${this.name}, 错误!`,e,t);break;case"Node.js":this.log("",`❗️${this.name}, 错误!`,e,void 0!==t.message?t.message:t,t.stack);break}}wait(t){return new Promise((e=>setTimeout(e,t)))}done(t={}){const e=((new Date).getTime()-this.startTime)/1e3;switch(this.log("",`🔔${this.name}, 结束! 🕛 ${e} 秒`),this.log(),this.getEnv()){case"Surge":case"Loon":case"Stash":case"Shadowrocket":case"Quantumult X":default:$done(t);break;case"Node.js":process.exit(1)}}}(t,e)}
+// API end
