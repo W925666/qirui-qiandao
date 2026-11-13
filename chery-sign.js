@@ -1,6 +1,6 @@
 /*
  * 奇瑞签到：2026-11-13 HAR 协议适配，原配置键 fmz200_chery_account 不变。
- * 仅签到，不自动分享文章；不保存或内置 HAR 中的账号/token。
+ * v2.0.0 完整版：签到、获取文章、分享前两篇；不保存或内置个人 token。
  * Node 使用系统安全随机数；Loon 优先安全随机源，缺失时用兼容随机 IV。
  * 内嵌 CryptoJS 4.1.1（MIT），便于 Loon 离线运行，不动态下载执行远程代码。
  * 仅做公开客户端协议兼容，不将这套固定共享密钥方案用于新的安全用途。
@@ -6239,10 +6239,11 @@ var CheryCryptoJS = (function () {
     return ivWords.clone().concat(encrypted.ciphertext).toString(CheryCryptoJS.enc.Base64).replace(/\+/g, '-');
   }
 
-  function buildRequest(token, path, method, data) {
+  function buildRequest(token, path, method, data, queryData) {
     var query = [];
-    if (method === 'GET') Object.keys(data || {}).forEach(function (key) {
-      query.push(encodeURIComponent(key) + '=' + encodeURIComponent(String(data[key])));
+    var parameters = method === 'GET' ? (data || {}) : (queryData || {});
+    Object.keys(parameters).forEach(function (key) {
+      query.push(encodeURIComponent(key) + '=' + encodeURIComponent(String(parameters[key])));
     });
     query.push('access_token=' + encodeURIComponent(token));
     var request = {
@@ -6353,9 +6354,77 @@ var CheryCryptoJS = (function () {
     return '签到接口已受理，但未查到今日已签到，请在 App 确认（未自动重试）';
   }
 
+  function articleIdsFromResponse(response) {
+    if (!response || !response.data || !Array.isArray(response.data.data)) {
+      throw new Error('文章列表格式异常，未自动分享');
+    }
+    var seen = Object.create(null), ids = [];
+    response.data.data.forEach(function (entry) {
+      if (ids.length >= 2 || !entry || !entry.content) return;
+      var rawId = entry.content.id;
+      // Avoid silently rounding 64-bit article IDs parsed as JS numbers.
+      if (typeof rawId === 'number' && (!Number.isSafeInteger(rawId) || rawId <= 0)) return;
+      if (typeof rawId !== 'number' && typeof rawId !== 'string') return;
+      var id = String(rawId);
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(id) || seen[id]) return;
+      seen[id] = true; ids.push(id);
+    });
+    return ids;
+  }
+
+  async function getArticleList(item, send) {
+    var response = await send(buildRequest(item.access_token, '/web/community/recommend/contents', 'GET', {
+      pageNo: 1, pageSize: 10, terminal: 3
+    }));
+    return articleIdsFromResponse(response);
+  }
+
+  async function shareArticle(item, articleId, send) {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(String(articleId))) throw new Error('文章 ID 不合法');
+    var response = await send(buildRequest(item.access_token,
+      '/web/community/contents/' + encodeURIComponent(String(articleId)) + '/share', 'POST',
+      { contentId: String(articleId) }, { terminal: 3 }));
+    if (response.data !== true) throw new Error('分享接口未返回 data=true，未自动重试');
+    return true;
+  }
+
+  async function runAccount(item, send, report) {
+    var messages = [];
+    function record(text) { messages.push(text); if (report) report(text); }
+    // Keep original ordering and independence: sign-in failure/already-done
+    // must not skip article retrieval or either share operation.
+    try { record(await signAccount(item, send)); }
+    catch (error) { record('签到失败：' + safeMessage(error.message)); }
+    var articleIds;
+    try {
+      articleIds = await getArticleList(item, send);
+      record('获取文章成功，共选取 ' + articleIds.length + ' 篇');
+    } catch (error) {
+      record('获取文章失败：' + safeMessage(error.message));
+      return messages;
+    }
+    if (!articleIds.length) { record('没有可分享文章，本次跳过分享'); return messages; }
+    for (var i = 0; i < articleIds.length; i++) {
+      try {
+        await shareArticle(item, articleIds[i], send);
+        record('分享第 ' + (i + 1) + ' 篇成功（接口返回成功，不保证积分到账）');
+      } catch (error) { record('分享第 ' + (i + 1) + ' 篇失败：' + safeMessage(error.message)); }
+    }
+    return messages;
+  }
+
+  async function notifyNode(text) {
+    var notifier;
+    try { notifier = require('../qinglong/sendNotify'); }
+    catch (_) { return; } // Standalone Node has no Qinglong notifier; console remains available.
+    if (!notifier || typeof notifier.sendNotify !== 'function') return;
+    try { await notifier.sendNotify('奇瑞签到', text); }
+    catch (_) { console.log('青龙通知发送失败，任务结果仍保留在日志中。'); }
+  }
+
   async function main() {
     var messages = [];
-    console.log('奇瑞签到：加密协议修复版，仅执行签到，不自动分享文章。');
+    console.log('奇瑞签到 v2.0.0：签到 → 获取文章 → 分享前两篇文章，完整流程。');
     try {
       var raw = isNode ? process.env.fmz200_chery_account : $persistentStore.read('fmz200_chery_account');
       var parsed = parseAccounts(raw);
@@ -6363,25 +6432,26 @@ var CheryCryptoJS = (function () {
       if (!parsed.accounts.length) throw new Error('没有可用 token，请重新获取当前登录凭据');
       for (var i = 0; i < parsed.accounts.length; i++) {
         var item = parsed.accounts[i], label = safeLabel(item, i);
-        try { messages.push('[' + label + '] ' + await signAccount(item, http)); }
-        catch (error) { messages.push('[' + label + '] ' + safeMessage(error.message)); }
+        await runAccount(item, http, function (text) {
+          var line = '[' + label + '] ' + text;
+          messages.push(line); console.log(line);
+        });
       }
     } catch (error) { messages.push(safeMessage(error.message)); }
-    console.log(messages.join('\n'));
+    if (isNode) await notifyNode(messages.join('\n'));
     if (!isNode && typeof $notification !== 'undefined') $notification.post('奇瑞签到', '', messages.join('\n'));
     return messages;
   }
 
   if (isNode) {
-    module.exports = { encryptText: encryptText, buildRequest: buildRequest, parseAccounts: parseAccounts, signAccount: signAccount, safeMessage: safeMessage };
+    module.exports = { encryptText: encryptText, buildRequest: buildRequest, parseAccounts: parseAccounts, signAccount: signAccount, getArticleList: getArticleList, shareArticle: shareArticle, articleIdsFromResponse: articleIdsFromResponse, runAccount: runAccount, main: main, safeMessage: safeMessage };
     if (require.main === module) main().catch(function () { console.error('执行异常，未输出敏感请求内容。'); process.exitCode = 1; });
   } else {
     // 测试上下文可注入钩子并禁止自动运行；手机正常执行不会提供这个对象。
     if (typeof __cheryTest !== 'undefined') {
-      __cheryTest.api = { encryptText: encryptText, buildRequest: buildRequest, parseAccounts: parseAccounts, signAccount: signAccount, safeMessage: safeMessage };
+      __cheryTest.api = { encryptText: encryptText, buildRequest: buildRequest, parseAccounts: parseAccounts, signAccount: signAccount, getArticleList: getArticleList, shareArticle: shareArticle, articleIdsFromResponse: articleIdsFromResponse, runAccount: runAccount, main: main, safeMessage: safeMessage };
     } else {
       main().catch(function () { console.log('执行异常，未输出敏感请求内容。'); }).then(function () { if (typeof $done !== 'undefined') $done(); });
     }
   }
 })();
-

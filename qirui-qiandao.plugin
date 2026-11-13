@@ -1,12 +1,12 @@
 #!name = 奇瑞签到
-#!desc = 自动获取本机登录凭据，每天08:00签到；已签到不重复提交，不自动分享文章。
+#!desc = v2.0.0 完整版：自动获取本机凭据，每天08:00签到、获取文章、分享前两篇；已签到仍执行文章任务。
 #!author = W925666
 #!homepage = https://github.com/W925666/qirui-qiandao
 #!date = 2026-11-13
 
 [Script]
-http-response ^https:\/\/mobile-consumer-sapp\.chery\.cn\/web\/task\/record\/sign-in\/daily(?:\?|$) script-path=https://raw.githubusercontent.com/W925666/qirui-qiandao/main/chery-capture.js,requires-body=true,timeout=10,tag=奇瑞签到-自动获取凭据
-cron "0 8 * * *" script-path=https://raw.githubusercontent.com/W925666/qirui-qiandao/main/chery-sign.js,timeout=300,tag=奇瑞签到
+http-response ^https:\/\/mobile-consumer-sapp\.chery\.cn\/web\/task\/record\/sign-in\/daily(?:\?|$) script-path=https://raw.githubusercontent.com/W925666/qirui-qiandao/refs/heads/main/chery-capture.js,requires-body=true,timeout=10,tag=奇瑞签到-自动获取凭据
+cron "0 8 * * *" script-path=https://raw.githubusercontent.com/W925666/qirui-qiandao/refs/heads/main/chery-sign.js,timeout=300,tag=奇瑞签到
 
 [Mitm]
 hostname = mobile-consumer-sapp.chery.cn
