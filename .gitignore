@@ -1,0 +1,9 @@
+﻿# Keep personal captures, credentials and diagnostic logs out of this repository.
+*.har
+*.log
+.env
+.env.*
+box.dat
+*account*.json
+*token*.json
+PUBLISH_READY.json
