@@ -23,10 +23,9 @@
     try { body = JSON.parse(response.body); }
     catch (_) { return { saved: false, reason: 'invalid-response' }; }
     if (Number(body.status) !== 200 || !body.data || typeof body.data.todayCompleted !== 'boolean') return { saved: false, reason: 'invalid-status' };
-    if (body.data.accountId === undefined || body.data.accountId === null || String(body.data.accountId) === '') {
-      return { saved: false, reason: 'missing-account-id' };
-    }
-    var accountId = String(body.data.accountId), accounts, previous = store.read(KEY);
+    var rawAccountId = body.data.accountId;
+    var accountId = rawAccountId === undefined || rawAccountId === null ? '' : String(rawAccountId);
+    var accounts, previous = store.read(KEY);
     try { accounts = previous ? JSON.parse(previous) : []; }
     catch (_) { return { saved: false, reason: 'invalid-storage' }; }
     if (!Array.isArray(accounts)) return { saved: false, reason: 'invalid-storage' };
@@ -40,9 +39,13 @@
     });
     var target = -1;
     unique.forEach(function (item, index) {
-      if (String(item.accountId || '') === accountId || item.access_token === token) target = index;
+      if ((accountId && String(item.accountId || '') === accountId) || item.access_token === token) target = index;
     });
-    // Migrate a single legacy account that has no accountId; avoid keeping expired duplicates.
+    // The current endpoint can return accountId:null. Maintain one rolling slot
+    // for such captures instead of appending every refreshed token indefinitely.
+    if (target < 0 && !accountId) unique.forEach(function (item, index) {
+      if (!item.accountId && item.captureSource === 'qirui-qiandao') target = index;
+    });
     if (target < 0 && unique.length === 1 && !unique[0].accountId) target = 0;
     var old = target >= 0 ? unique[target] : {};
     var item = Object.assign({}, old, {
@@ -50,6 +53,7 @@
       accountId: accountId,
       displayName: old.displayName || ('账号' + (target >= 0 ? target + 1 : unique.length + 1))
     });
+    if (!accountId) { delete item.accountId; item.captureSource = 'qirui-qiandao'; }
     var changed = old.access_token !== token || String(old.accountId || '') !== accountId || unique.length !== accounts.length;
     if (!changed) return { saved: false, reason: 'unchanged' };
     if (target >= 0) unique[target] = item;
