@@ -1,4 +1,4 @@
-﻿# Keep personal captures, credentials and diagnostic logs out of this repository.
+# Keep personal captures, credentials and diagnostic logs out of this repository.
 *.har
 *.log
 .env
